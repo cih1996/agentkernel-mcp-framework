@@ -19,7 +19,7 @@ Its responsibilities are:
 4. Convert discovered MCP tools into tool definitions that can be registered into AgentKernel.
 5. Receive tool-call requests from the business layer and proxy them to remote MCP `tools/call`.
 
-It is independent from [AgentKernel Capabilities](https://github.com/cih1996/agentkernel-capabilities):
+It can work with [AgentKernel Capabilities](https://github.com/cih1996/agentkernel-capabilities):
 
 - `agentkernel-capabilities`: concrete capability server exposing tools such as `glob/read/bash`.
 - `agentkernel-mcp-framework`: generic MCP discovery/execution framework for loading, routing, and proxying tool calls.
