@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "local-code-suite": {
+      "command": "/Users/cih1996/work/agentkernel-capabilities/target/release/agentkernel-capabilities",
+      "args": [
+        "--workspace",
+        "/Users/cih1996/work/ai-scaffold"
+      ],
+      "env": {}
+    }
+  }
+}
