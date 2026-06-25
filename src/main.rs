@@ -7,7 +7,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -30,6 +30,7 @@ const LOG_PREVIEW_LIMIT: usize = 4000;
 const DEFAULT_INIT_TIMEOUT_MS: u64 = 10_000;
 const DEFAULT_LIST_TOOLS_TIMEOUT_MS: u64 = 10_000;
 const DEFAULT_TOOL_CALL_TIMEOUT_MS: u64 = 300_000;
+const STDERR_BUFFER_LIMIT: usize = 50;
 
 #[derive(Debug, Error)]
 enum FrameworkError {
@@ -87,6 +88,8 @@ struct McpServerConfig {
     #[serde(default)]
     args: Vec<String>,
     #[serde(default)]
+    cwd: Option<String>,
+    #[serde(default)]
     env: HashMap<String, String>,
 }
 
@@ -105,6 +108,7 @@ struct ManagedServer {
     stdout: BufReader<ChildStdout>,
     request_id: u64,
     tools: Vec<ToolDefinition>,
+    stderr_lines: Arc<Mutex<VecDeque<String>>>,
 }
 
 #[derive(Clone)]
@@ -173,7 +177,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
     let logging = init_logging(&args)?;
     let host = arg_value(&args, "--host").unwrap_or_else(|| "127.0.0.1".to_string());
-    let port = arg_value(&args, "--port").unwrap_or_else(|| "9528".to_string());
+    let port = arg_value(&args, "--port").unwrap_or_else(|| "19528".to_string());
     let addr: SocketAddr = format!("{host}:{port}").parse()?;
     let timeouts = TimeoutConfig {
         initialize: timeout_from_args_env(
@@ -339,6 +343,7 @@ fn sanitized_server_config(config: &McpServerConfig) -> Value {
     json!({
         "command": config.command,
         "args": config.args,
+        "cwd": config.cwd,
         "env": masked_env(&config.env),
         "envKeys": env_keys,
         "envCount": config.env.len()
@@ -799,22 +804,37 @@ async fn call_tool_proxy(state: &AppState, req: CallToolRequest) -> Result<Value
 impl ManagedServer {
     async fn start(name: String, config: McpServerConfig) -> Result<Self, FrameworkError> {
         let current_dir = std::env::current_dir().ok();
+        let resolved_cwd = config.cwd.as_ref().and_then(|raw| {
+            let path = PathBuf::from(raw);
+            if path.is_absolute() {
+                Some(path)
+            } else {
+                current_dir.as_ref().map(|base| base.join(path))
+            }
+        });
         log_json("MCP进程启动参数", &name, &sanitized_server_config(&config));
         log_text(
             "MCP进程启动上下文",
             &name,
             &format!(
-                "cwd={} command_exists={}",
+                "cwd={} child_cwd={} command_exists={}",
                 current_dir
                     .as_ref()
                     .map(|path| path.display().to_string())
                     .unwrap_or_else(|| "<unknown>".to_string()),
+                resolved_cwd
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| "<inherit>".to_string()),
                 Path::new(&config.command).exists()
             ),
         );
         let mut command = Command::new(&config.command);
         command.args(&config.args);
         command.envs(&config.env);
+        if let Some(cwd) = &resolved_cwd {
+            command.current_dir(cwd);
+        }
         command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
 
         let mut child = match command.spawn() {
@@ -832,7 +852,8 @@ impl ManagedServer {
         let stdin = child.stdin.take().ok_or_else(|| FrameworkError::Mcp("failed to open child stdin".into()))?;
         let stdout = child.stdout.take().ok_or_else(|| FrameworkError::Mcp("failed to open child stdout".into()))?;
         let stderr = child.stderr.take().ok_or_else(|| FrameworkError::Mcp("failed to open child stderr".into()))?;
-        spawn_stderr_logger(name.clone(), stderr);
+        let stderr_lines = Arc::new(Mutex::new(VecDeque::with_capacity(STDERR_BUFFER_LIMIT)));
+        spawn_stderr_logger(name.clone(), stderr, stderr_lines.clone());
 
         Ok(Self {
             name,
@@ -841,6 +862,7 @@ impl ManagedServer {
             stdout: BufReader::new(stdout),
             request_id: 0,
             tools: Vec::new(),
+            stderr_lines,
         })
     }
 
@@ -976,8 +998,9 @@ impl ManagedServer {
         let mut line = String::new();
         let bytes = self.stdout.read_line(&mut line).await?;
         if bytes == 0 {
-            log_error_text("MCP标准输出关闭", &self.name, "mcp server closed stdout");
-            return Err(FrameworkError::Mcp("mcp server closed stdout".into()));
+            let details = self.describe_process_exit().await;
+            log_error_text("MCP标准输出关闭", &self.name, &details);
+            return Err(FrameworkError::Mcp(details));
         }
         let trimmed = line.trim();
         log_text(
@@ -987,16 +1010,56 @@ impl ManagedServer {
         );
         serde_json::from_str(trimmed).map_err(FrameworkError::from)
     }
+
+    async fn describe_process_exit(&mut self) -> String {
+        let exit_text = match self.child.try_wait() {
+            Ok(Some(status)) => format!("exit_status={status}"),
+            Ok(None) => "exit_status=running_or_unknown".to_string(),
+            Err(err) => format!("exit_status=unknown try_wait_error={err}"),
+        };
+        let stderr = self.recent_stderr_text().await;
+        if stderr.is_empty() {
+            format!("mcp server closed stdout ({exit_text})")
+        } else {
+            format!("mcp server closed stdout ({exit_text}) stderr_tail={stderr}")
+        }
+    }
+
+    async fn recent_stderr_text(&self) -> String {
+        let stderr_lines = self.stderr_lines.lock().await;
+        if stderr_lines.is_empty() {
+            return String::new();
+        }
+        stderr_lines
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(" | ")
+    }
 }
 
-fn spawn_stderr_logger(server_name: String, stderr: ChildStderr) {
+fn spawn_stderr_logger(
+    server_name: String,
+    stderr: ChildStderr,
+    stderr_lines: Arc<Mutex<VecDeque<String>>>,
+) {
     tokio::spawn(async move {
         let mut reader = BufReader::new(stderr);
         loop {
             let mut line = String::new();
             match reader.read_line(&mut line).await {
                 Ok(0) => break,
-                Ok(_) => log_warn_text("MCP标准错误", &server_name, line.trim()),
+                Ok(_) => {
+                    let line = line.trim().to_string();
+                    {
+                        let mut buffer = stderr_lines.lock().await;
+                        if buffer.len() >= STDERR_BUFFER_LIMIT {
+                            buffer.pop_front();
+                        }
+                        buffer.push_back(line.clone());
+                    }
+                    log_warn_text("MCP标准错误", &server_name, &line);
+                }
                 Err(err) => {
                     log_error_text("MCP标准错误异常", &server_name, &err.to_string());
                     break;

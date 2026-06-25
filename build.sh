@@ -4,7 +4,20 @@ set -euo pipefail
 # ─── 配置 ─────────────────────────────────
 PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BINARY_NAME="agentkernel-mcp-framework"
-VERSION="$(grep '^version' "$PROJECT_DIR/Cargo.toml" | head -1 | sed 's/.*"\(.*\)"/\1/')"
+VERSION="$(python3 - "$PROJECT_DIR/Cargo.toml" <<'PY'
+import pathlib
+import sys
+
+cargo_toml = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+try:
+    import tomllib
+except ModuleNotFoundError:
+    import tomli as tomllib
+
+data = tomllib.loads(cargo_toml)
+print(data["package"]["version"])
+PY
+)"
 
 usage() {
   echo "用法: ./build.sh [选项]"
